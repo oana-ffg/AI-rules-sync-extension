@@ -1,0 +1,65 @@
+{
+  "name": "agent-rules-sync",
+  "displayName": "Agent Rules Sync",
+  "description": "Unified editor for syncing coding agent rule files (AGENTS.md, Claude.md, .cursor/rules/project-rules.mdc)",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:agentRulesSync.openRulesEditor"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentRulesSync.openRulesEditor",
+        "title": "Open Agent Rules Editor",
+        "category": "Agent Rules"
+      },
+      {
+        "command": "agentRulesSync.addRuleFile",
+        "title": "Add Agent Rule File",
+        "category": "Agent Rules"
+      },
+      {
+        "command": "agentRulesSync.removeRuleFile",
+        "title": "Remove Agent Rule File",
+        "category": "Agent Rules"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Rules Sync",
+      "properties": {
+        "agentRulesSync.ruleFiles": {
+          "type": "array",
+          "default": [
+            "AGENTS.md",
+            "Claude.md",
+            ".cursor/rules/project-rules.mdc",
+            ".github/copilot-instructions.md",
+            ".roo/rules/rules.md",
+            ".windsurfrules"
+          ],
+          "description": "List of agent rule files to sync",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.74.0",
+    "@types/node": "16.x",
+    "typescript": "^4.9.4"
+  }
+} 

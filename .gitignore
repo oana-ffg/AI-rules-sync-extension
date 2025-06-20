@@ -1,0 +1,34 @@
+# Compiled output
+out/
+dist/
+*.vsix
+
+# Dependencies
+node_modules/
+
+# IDE
+.idea/
+# Note: .vscode/ is included for extension development (launch.json, tasks.json)
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Temporary files
+*.tmp
+*.temp
