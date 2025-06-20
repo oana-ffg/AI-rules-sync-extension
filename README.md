@@ -78,4 +78,39 @@ You can also manually edit the agent rule files list in VS Code settings:
 3. **Directory Creation**: Missing directories are automatically created when saving rule files
 4. **File Status**: The interface shows which rule files exist and when they were last modified
 
-This is perfect for keeping your coding agent instructions synchronized across different AI tools and platforms - whether you're using Claude, Cursor, GitHub Copilot, Windsurf, or other AI coding assistants. 
+This is perfect for keeping your coding agent instructions synchronized across different AI tools and platforms - whether you're using Claude, Cursor, GitHub Copilot, Windsurf, or other AI coding assistants.
+
+## Installation
+
+### Install from VSIX File
+
+1. **Download the extension:**
+   - Get the latest `agent-rules-sync-x.x.x.vsix` file from the [GitHub Releases](https://github.com/oana-ffg/AI-rules-sync-extension/releases)
+
+2. **Install in VS Code/Cursor:**
+   - **Method 1 (Command Palette):**
+     - Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
+     - Type: `Extensions: Install from VSIX...`
+     - Select the downloaded `.vsix` file
+   
+   - **Method 2 (Extensions Panel):**
+     - Open Extensions panel (`Cmd+Shift+X` or `Ctrl+Shift+X`)
+     - Click the `...` (three dots) menu in the top-right
+     - Select `Install from VSIX...`
+     - Choose the downloaded `.vsix` file
+
+3. **Verify installation:**
+   - Open Command Palette (`Cmd+Shift+P` or `Ctrl+Shift+P`)
+   - Type "Agent Rules" - you should see the extension commands available
+
+### Alternative: Build from Source
+
+```bash
+git clone https://github.com/oana-ffg/AI-rules-sync-extension.git
+cd AI-rules-sync-extension
+npm install
+npm run compile
+npx vsce package --no-dependencies
+```
+
+Then install the generated `.vsix` file using the steps above. 

@@ -3,6 +3,10 @@
   "displayName": "Agent Rules Sync",
   "description": "Unified editor for syncing coding agent rule files (AGENTS.md, Claude.md, .cursor/rules/project-rules.mdc)",
   "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oana-ffg/AI-rules-sync-extension"
+  },
   "engines": {
     "vscode": "^1.74.0"
   },
