@@ -14,6 +14,16 @@ export function activate(context: vscode.ExtensionContext) {
         AgentRulesPanel.createOrShow(context.extensionUri);
     });
 
+    // Create status bar button for easy access
+    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusBarItem.text = "$(edit) Agent Rules";
+    statusBarItem.tooltip = "Open Agent Rules Editor";
+    statusBarItem.command = 'agentRulesSync.openRulesEditor';
+    statusBarItem.show();
+    
+    // Make sure the status bar item is disposed when extension deactivates
+    context.subscriptions.push(statusBarItem);
+
     // Register command to add a new rule file to the sync list
     // This allows users to dynamically add more agent rule files to sync
     const addRuleFile = vscode.commands.registerCommand('agentRulesSync.addRuleFile', async () => {

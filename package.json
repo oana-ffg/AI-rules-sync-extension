@@ -14,7 +14,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:agentRulesSync.openRulesEditor"
+    "*"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -54,6 +54,28 @@
           }
         }
       }
+    },
+    "keybindings": [
+      {
+        "command": "agentRulesSync.openRulesEditor",
+        "key": "ctrl+shift+r",
+        "mac": "cmd+shift+r",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "agentRulesSync.openRulesEditor",
+          "group": "2_workspace"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "agentRulesSync.openRulesEditor",
+          "group": "1_modification"
+        }
+      ]
     }
   },
   "scripts": {
