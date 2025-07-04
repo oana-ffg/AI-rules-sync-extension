@@ -2,7 +2,7 @@
   "name": "agent-rules-sync",
   "displayName": "Agent Rules Sync",
   "description": "Unified editor for syncing coding agent rule files (AGENTS.md, Claude.md, .cursor/rules/project-rules.mdc)",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "FireFunGames",
   "repository": {
     "type": "git",
