@@ -2,6 +2,37 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
+// Resolve both lexical paths and symlink targets before reading or writing.
+// Missing descendants are allowed only beneath a real directory in the workspace.
+function ruleFilePath(workspace: string, file: string): string {
+    if (!file || path.isAbsolute(file) || path.win32.isAbsolute(file)) {
+        throw new Error('Rule file must be a relative path inside the workspace');
+    }
+    const root = fs.realpathSync(workspace);
+    const target = path.resolve(root, file);
+    const isInside = (candidate: string) => {
+        const relative = path.relative(root, candidate);
+        return relative !== '' && relative !== '..' &&
+            !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+    };
+    if (!isInside(target)) throw new Error('Rule file must stay inside the workspace');
+    let existing = target;
+    while (true) {
+        try {
+            fs.lstatSync(existing);
+            break;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            existing = path.dirname(existing);
+        }
+    }
+    const real = fs.realpathSync(existing);
+    if (real !== root && !isInside(real)) {
+        throw new Error('Rule file symlink points outside the workspace');
+    }
+    return target;
+}
+
 /**
  * Extension activation function - called when the extension is first activated
  * This happens when one of our commands is executed for the first time
@@ -91,7 +122,6 @@ class AgentRulesPanel {
 
     // Private properties for the webview panel and extension resources
     private readonly _panel: vscode.WebviewPanel;
-    private readonly _extensionUri: vscode.Uri;
     private _disposables: vscode.Disposable[] = []; // Track disposables for cleanup
 
     /**
@@ -124,16 +154,15 @@ class AgentRulesPanel {
         );
 
         // Create new panel instance
-        AgentRulesPanel.currentPanel = new AgentRulesPanel(panel, extensionUri);
+        AgentRulesPanel.currentPanel = new AgentRulesPanel(panel);
     }
 
     /**
      * Private constructor - called only by createOrShow()
      * Sets up the webview panel and message handling
      */
-    private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
+    private constructor(panel: vscode.WebviewPanel) {
         this._panel = panel;
-        this._extensionUri = extensionUri;
 
         // Set the initial HTML content for the webview
         this._update();
@@ -173,6 +202,18 @@ class AgentRulesPanel {
 
         if (!workspaceFolder) {
             vscode.window.showErrorMessage('No workspace folder found');
+            this._panel.webview.postMessage({
+                command: 'saveResults',
+                error: 'No workspace folder found',
+                results: syncedFiles.map(file => ({ file, success: false, error: 'No workspace folder found' }))
+            });
+            return;
+        }
+
+        if (syncedFiles.length === 0) {
+            const error = 'No rule files configured';
+            vscode.window.showErrorMessage(error);
+            this._panel.webview.postMessage({ command: 'saveResults', error, results: [] });
             return;
         }
 
@@ -182,7 +223,7 @@ class AgentRulesPanel {
         // Attempt to save content to each configured file
         for (const filePath of syncedFiles) {
             try {
-                const fullPath = path.join(workspaceFolder.uri.fsPath, filePath);
+                const fullPath = ruleFilePath(workspaceFolder.uri.fsPath, filePath);
                 const dir = path.dirname(fullPath);
                 
                 // Create directory structure if it doesn't exist (e.g., .cursor/rules/)
@@ -244,59 +285,23 @@ class AgentRulesPanel {
         let content = '';
         const fileStatuses: { file: string; exists: boolean; lastModified?: string }[] = [];
 
-        // Priority-based loading: use content from first existing file in the list
-        // This establishes the "source of truth" when files might have different content
+        // Load from the first readable file, but report every configured file once.
+        let contentLoaded = false;
         for (const filePath of syncedFiles) {
             try {
-                const fullPath = path.join(workspaceFolder.uri.fsPath, filePath);
-                if (fs.existsSync(fullPath)) {
-                    const stats = fs.statSync(fullPath);
+                const fullPath = ruleFilePath(workspaceFolder.uri.fsPath, filePath);
+                const stats = fs.statSync(fullPath);
+                if (!contentLoaded) {
                     content = fs.readFileSync(fullPath, 'utf8');
-                    fileStatuses.push({
-                        file: filePath,
-                        exists: true,
-                        lastModified: stats.mtime.toISOString()
-                    });
-                    break; // Use content from first existing file - this is our "source of truth"
-                } else {
-                    fileStatuses.push({
-                        file: filePath,
-                        exists: false
-                    });
+                    contentLoaded = true;
                 }
-            } catch (error) {
-                // File exists but can't be read (permissions, etc.)
                 fileStatuses.push({
                     file: filePath,
-                    exists: false
+                    exists: true,
+                    lastModified: stats.mtime.toISOString()
                 });
-            }
-        }
-
-        // Check status of all remaining files (for UI display)
-        // We already checked the first file above, now check the rest
-        for (let i = 1; i < syncedFiles.length; i++) {
-            const filePath = syncedFiles[i];
-            try {
-                const fullPath = path.join(workspaceFolder.uri.fsPath, filePath);
-                if (fs.existsSync(fullPath)) {
-                    const stats = fs.statSync(fullPath);
-                    fileStatuses.push({
-                        file: filePath,
-                        exists: true,
-                        lastModified: stats.mtime.toISOString()
-                    });
-                } else {
-                    fileStatuses.push({
-                        file: filePath,
-                        exists: false
-                    });
-                }
             } catch (error) {
-                fileStatuses.push({
-                    file: filePath,
-                    exists: false
-                });
+                fileStatuses.push({ file: filePath, exists: false });
             }
         }
 
@@ -333,15 +338,14 @@ class AgentRulesPanel {
      * Called once when panel is created
      */
     private _update() {
-        const webview = this._panel.webview;
-        this._panel.webview.html = this._getHtmlForWebview(webview);
+        this._panel.webview.html = this._getHtmlForWebview();
     }
 
     /**
      * Generate the HTML content for the webview
      * This creates the entire user interface with embedded CSS and JavaScript
      */
-    private _getHtmlForWebview(webview: vscode.Webview) {
+    private _getHtmlForWebview() {
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -520,7 +524,7 @@ class AgentRulesPanel {
             files.forEach(file => {
                 const badge = document.createElement('div');
                 badge.className = 'file-status ' + (file.exists ? 'file-exists' : 'file-missing');
-                badge.innerHTML = file.exists 
+                badge.textContent = file.exists
                     ? '✓ ' + file.file + (file.lastModified ? ' (' + new Date(file.lastModified).toLocaleString() + ')' : '')
                     : '✗ ' + file.file + ' (missing)';
                 fileListDiv.appendChild(badge);
@@ -564,6 +568,10 @@ class AgentRulesPanel {
                 case 'saveResults':
                     // Backend sent us save operation results
                     saveBtn.disabled = false;
+                    if (message.error) {
+                        showStatus(message.error, 'error');
+                        break;
+                    }
                     const successful = message.results.filter(r => r.success).length;
                     const failed = message.results.filter(r => !r.success).length;
                     
@@ -588,4 +596,4 @@ class AgentRulesPanel {
  * Extension deactivation function - called when the extension is deactivated
  * Currently no cleanup is needed as VS Code handles disposing of our command registrations
  */
-export function deactivate() {} 
+export function deactivate() {}
