@@ -6,15 +6,17 @@ A VS Code/Cursor extension that provides a unified editor for syncing coding age
 
 - **Unified Agent Rules Editor**: Edit your coding agent instructions in one place and sync across all rule files
 - **Custom Rule Files**: Add or remove agent rule files from the sync list dynamically  
-- **File Status Tracking**: Visual indicators show which rule files exist and their last modification times
+- **File Status Tracking**: Visual indicators show which rule files exist, which differ from the loaded rules, and their last modification times
+- **Overwrite Protection**: Asks before overwriting a rule file whose content differs from the loaded rules, including edits made on disk after loading
+- **Per-File Frontmatter**: YAML frontmatter (such as Cursor's `alwaysApply`) stays with its own file and is never copied into the other rule files
 - **Automatic Directory Creation**: Creates missing directories when saving rule files
-- **Error Handling**: Clear feedback on save success/failure for each rule file
+- **Error Handling**: Clear feedback on save success/failure for each rule file, and unreadable or rejected paths are reported as errors
 
 ## Default Agent Rule Files
 
 The extension comes pre-configured to sync these common agent rule files:
 - `AGENTS.md` - General agent instructions
-- `Claude.md` - Claude-specific rules
+- `CLAUDE.md` - Claude Code rules
 - `.cursor/rules/project-rules.mdc` - Cursor/VS Code project rules
 - `.github/copilot-instructions.md` - GitHub Copilot instructions
 - `.roo/rules/rules.md` - Roo agent rules  
@@ -28,12 +30,14 @@ The extension comes pre-configured to sync these common agent rule files:
 2. Run the command: **"Agent Rules: Open Agent Rules Editor"**
 3. The rules editor will open in a new panel
 
+You can also click **Agent Rules** in the status bar, use the editor or explorer context menu, or press `Cmd+Shift+R` in a text editor on Mac.
+
 ### Using the Agent Rules Editor
 
 - **Load Rules**: Click "Load Rules" to load existing rules from the first available rule file
 - **Edit**: Make your changes to your agent instructions in the text area
 - **Save**: Click "Save to All Rule Files" to sync the rules across all configured files
-- **File Status**: Green badges show existing rule files, red badges show missing rule files
+- **File Status**: Green badges show rule files in sync with the loaded rules, yellow badges show files with different content, and red badges show missing or unusable files
 
 ### Managing Agent Rule Files
 
@@ -55,6 +59,10 @@ You can also manually edit the agent rule files list in VS Code settings:
 2. Search for "Agent Rules Sync"
 3. Edit the "Rule Files" array
 
+Rule file paths must be relative and stay inside the first workspace folder; symlinks that point outside it are rejected.
+
+In [Restricted Mode](https://code.visualstudio.com/docs/editor/workspace-trust), the rule file list is only read from your user settings, so an untrusted repository cannot choose which files the editor overwrites.
+
 ## Development
 
 ### Setup
@@ -65,6 +73,8 @@ You can also manually edit the agent rule files list in VS Code settings:
 ### Build
 - `npm run compile` - Compile TypeScript
 - `npm run watch` - Watch for changes and recompile
+- `npm test` - Compile and run the tests
+- `npm run package` - Build the `.vsix` package
 
 ## Requirements
 
@@ -73,14 +83,16 @@ You can also manually edit the agent rule files list in VS Code settings:
 
 ## How It Works
 
-1. **Rules Loading**: The extension reads agent rules from the first existing rule file in your list
-2. **Rules Saving**: When you save, the extension writes the same rules to all configured rule files
+1. **Rules Loading**: The extension reads agent rules from the first existing rule file in your list, without its frontmatter
+2. **Rules Saving**: When you save, the extension writes the same rules to all configured rule files, keeping each file's existing frontmatter
 3. **Directory Creation**: Missing directories are automatically created when saving rule files
 4. **File Status**: The interface shows which rule files exist and when they were last modified
 
 This is perfect for keeping your coding agent instructions synchronized across different AI tools and platforms - whether you're using Claude, Cursor, GitHub Copilot, Windsurf, or other AI coding assistants.
 
 ## Installation
+
+Install **Agent Rules Sync** from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=FireFunGames.agent-rules-sync), or from a VSIX file:
 
 ### Install from VSIX File
 
@@ -109,8 +121,7 @@ This is perfect for keeping your coding agent instructions synchronized across d
 git clone https://github.com/oana-ffg/AI-rules-sync-extension.git
 cd AI-rules-sync-extension
 npm install
-npm run compile
-npx vsce package --no-dependencies
+npm run package
 ```
 
 Then install the generated `.vsix` file using the steps above. 

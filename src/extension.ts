@@ -1,6 +1,19 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+
+type FileStatus = {
+    file: string;
+    state: 'present' | 'missing' | 'error';
+    inSync?: boolean;
+    lastModified?: string;
+    error?: string;
+};
+
+type RuleFile = FileStatus & { fullPath?: string; frontmatter?: string; body?: string };
+
+type SaveResult = { file: string; success: boolean; error?: string };
 
 // Resolve both lexical paths and symlink targets before reading or writing.
 // Missing descendants are allowed only beneath a real directory in the workspace.
@@ -33,155 +46,169 @@ function ruleFilePath(workspace: string, file: string): string {
     return target;
 }
 
-/**
- * Extension activation function - called when the extension is first activated
- * This happens when one of our commands is executed for the first time
- */
+// YAML frontmatter (e.g. Cursor's `alwaysApply`) configures one tool's file, so it is
+// kept per file and never copied into the shared rules body.
+function splitFrontmatter(text: string): { frontmatter: string; body: string } {
+    const match = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(text);
+    return match
+        ? { frontmatter: match[0], body: text.slice(match[0].length) }
+        : { frontmatter: '', body: text };
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function configuredRuleFiles(): string[] {
+    return vscode.workspace.getConfiguration('agentRulesSync').get<string[]>('ruleFiles', []);
+}
+
+function readRuleFiles(workspace: string, files: string[]): RuleFile[] {
+    return files.map((file): RuleFile => {
+        let fullPath: string;
+        try {
+            fullPath = ruleFilePath(workspace, file);
+        } catch (error) {
+            return { file, state: 'error', error: errorMessage(error) };
+        }
+        try {
+            const stats = fs.statSync(fullPath);
+            const { frontmatter, body } = splitFrontmatter(fs.readFileSync(fullPath, 'utf8'));
+            return { file, state: 'present', fullPath, frontmatter, body, lastModified: stats.mtime.toISOString() };
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { file, state: 'missing', fullPath };
+            return { file, state: 'error', error: errorMessage(error) };
+        }
+    });
+}
+
 export function activate(context: vscode.ExtensionContext) {
-    
-    // Register command to open the main agent rules editor interface
-    // This creates or reveals the webview panel where users edit their agent rules
     const openRulesEditor = vscode.commands.registerCommand('agentRulesSync.openRulesEditor', () => {
-        AgentRulesPanel.createOrShow(context.extensionUri);
+        AgentRulesPanel.createOrShow();
     });
 
-    // Create status bar button for easy access
+    // Status bar button for easy access
     const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.text = "$(edit) Agent Rules";
     statusBarItem.tooltip = "Open Agent Rules Editor";
     statusBarItem.command = 'agentRulesSync.openRulesEditor';
     statusBarItem.show();
-    
-    // Make sure the status bar item is disposed when extension deactivates
-    context.subscriptions.push(statusBarItem);
 
-    // Register command to add a new rule file to the sync list
-    // This allows users to dynamically add more agent rule files to sync
     const addRuleFile = vscode.commands.registerCommand('agentRulesSync.addRuleFile', async () => {
-        // Show input box for user to enter the file path
-        const filePath = await vscode.window.showInputBox({
-            prompt: 'Enter agent rule file path to add',
-            placeHolder: 'e.g., .github/copilot-instructions.md'
-        });
-
-        if (filePath) {
-            // Get current configuration for this extension
-            const config = vscode.workspace.getConfiguration('agentRulesSync');
-            const currentFiles = config.get<string[]>('ruleFiles', []);
-            
-            // Check if file is already in the list to avoid duplicates
-            if (!currentFiles.includes(filePath)) {
-                currentFiles.push(filePath);
-                // Update the workspace configuration with the new file list
-                await config.update('ruleFiles', currentFiles, vscode.ConfigurationTarget.Workspace);
-                vscode.window.showInformationMessage(`Added ${filePath} to agent rule files`);
-            } else {
-                vscode.window.showWarningMessage(`${filePath} is already in agent rule files`);
-            }
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage('Open a workspace folder before adding agent rule files');
+            return;
         }
+        const input = await vscode.window.showInputBox({
+            prompt: 'Enter agent rule file path to add',
+            placeHolder: 'e.g., .github/copilot-instructions.md',
+            validateInput: (value) => {
+                if (!value.trim()) return undefined;
+                try {
+                    ruleFilePath(workspaceFolder.uri.fsPath, value.trim());
+                    return undefined;
+                } catch (error) {
+                    return errorMessage(error);
+                }
+            }
+        });
+        const filePath = input?.trim();
+        if (!filePath) return;
+
+        const currentFiles = configuredRuleFiles();
+        if (currentFiles.includes(filePath)) {
+            vscode.window.showWarningMessage(`${filePath} is already in agent rule files`);
+            return;
+        }
+        await vscode.workspace.getConfiguration('agentRulesSync')
+            .update('ruleFiles', [...currentFiles, filePath], vscode.ConfigurationTarget.Workspace);
+        vscode.window.showInformationMessage(`Added ${filePath} to agent rule files`);
     });
 
-    // Register command to remove a rule file from the sync list
-    // This allows users to stop syncing specific agent rule files
     const removeRuleFile = vscode.commands.registerCommand('agentRulesSync.removeRuleFile', async () => {
-        const config = vscode.workspace.getConfiguration('agentRulesSync');
-        const currentFiles = config.get<string[]>('ruleFiles', []);
-        
-        // Check if there are any files to remove
+        if (!vscode.workspace.workspaceFolders?.length) {
+            vscode.window.showErrorMessage('Open a workspace folder before removing agent rule files');
+            return;
+        }
+        const currentFiles = configuredRuleFiles();
         if (currentFiles.length === 0) {
             vscode.window.showInformationMessage('No rule files to remove');
             return;
         }
 
-        // Show dropdown menu with current files for user to select from
         const fileToRemove = await vscode.window.showQuickPick(currentFiles, {
             placeHolder: 'Select agent rule file to remove'
         });
+        if (!fileToRemove) return;
 
-        if (fileToRemove) {
-            // Remove the selected file from the list and update configuration
-            const updatedFiles = currentFiles.filter(file => file !== fileToRemove);
-            await config.update('ruleFiles', updatedFiles, vscode.ConfigurationTarget.Workspace);
-            vscode.window.showInformationMessage(`Removed ${fileToRemove} from agent rule files`);
-        }
+        await vscode.workspace.getConfiguration('agentRulesSync').update(
+            'ruleFiles', currentFiles.filter(file => file !== fileToRemove), vscode.ConfigurationTarget.Workspace);
+        vscode.window.showInformationMessage(`Removed ${fileToRemove} from agent rule files`);
     });
 
-    // Register all commands with VS Code so they can be disposed when extension deactivates
-    context.subscriptions.push(openRulesEditor, addRuleFile, removeRuleFile);
+    context.subscriptions.push(statusBarItem, openRulesEditor, addRuleFile, removeRuleFile);
 }
 
 /**
- * AgentRulesPanel class manages the webview panel for editing agent rules
- * This is a singleton - only one panel can be open at a time
+ * Singleton webview panel for editing the shared agent rules.
  */
 class AgentRulesPanel {
-    // Static reference to the current panel instance (singleton pattern)
-    public static currentPanel: AgentRulesPanel | undefined;
-    // Unique identifier for this webview type
-    public static readonly viewType = 'agentRulesEditor';
+    private static currentPanel: AgentRulesPanel | undefined;
+    private static readonly viewType = 'agentRulesEditor';
 
-    // Private properties for the webview panel and extension resources
     private readonly _panel: vscode.WebviewPanel;
-    private _disposables: vscode.Disposable[] = []; // Track disposables for cleanup
+    private _disposables: vscode.Disposable[] = [];
+    // Rules body as last loaded or saved; files that drift from it need confirmation to overwrite.
+    private _baseline: string | undefined;
 
-    /**
-     * Static method to create or show the agent rules panel
-     * Implements singleton pattern - only one panel can be open at a time
-     */
-    public static createOrShow(extensionUri: vscode.Uri) {
-        // Try to open panel in the same column as the active editor
-        const column = vscode.window.activeTextEditor
-            ? vscode.window.activeTextEditor.viewColumn
-            : undefined;
+    public static createOrShow() {
+        const column = vscode.window.activeTextEditor?.viewColumn;
 
-        // If panel already exists, just bring it to the front
         if (AgentRulesPanel.currentPanel) {
             AgentRulesPanel.currentPanel._panel.reveal(column);
             return;
         }
 
-        // Create new webview panel with HTML/JavaScript capabilities
         const panel = vscode.window.createWebviewPanel(
             AgentRulesPanel.viewType,
             'Agent Rules Editor',
             column || vscode.ViewColumn.One,
             {
-                // Enable JavaScript in the webview
                 enableScripts: true,
-                // Allow loading local resources (if we had any CSS/JS files)
-                localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')]
+                // The UI is fully inline and must not read any local files.
+                localResourceRoots: [],
+                // Keep unsaved edits when the panel is moved to a background tab.
+                retainContextWhenHidden: true
             }
         );
 
-        // Create new panel instance
         AgentRulesPanel.currentPanel = new AgentRulesPanel(panel);
     }
 
-    /**
-     * Private constructor - called only by createOrShow()
-     * Sets up the webview panel and message handling
-     */
     private constructor(panel: vscode.WebviewPanel) {
         this._panel = panel;
+        this._panel.webview.html = this._getHtmlForWebview();
 
-        // Set the initial HTML content for the webview
-        this._update();
-
-        // Listen for when the panel is disposed (closed by user)
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
 
-        // Listen for messages from the webview JavaScript
-        // This handles communication between the HTML/JS frontend and the extension backend
+        // Rule files can change on disk while the panel is in the background.
+        this._panel.onDidChangeViewState(event => {
+            if (event.webviewPanel.visible) this._postStatuses();
+        }, null, this._disposables);
+
+        vscode.workspace.onDidChangeConfiguration(event => {
+            if (event.affectsConfiguration('agentRulesSync.ruleFiles')) this._postStatuses();
+        }, null, this._disposables);
+
         this._panel.webview.onDidReceiveMessage(
             async (message) => {
-                switch (message.command) {
+                switch (message?.command) {
                     case 'save':
-                        // User clicked "Save to All Rule Files" - save content to all configured files
-                        await this._saveToAllFiles(message.content);
+                        await this._handleSave(message.content);
                         break;
                     case 'load':
-                        // User clicked "Load Rules" - load content from first available file
-                        await this._loadContent();
+                        this._loadContent();
                         break;
                 }
             },
@@ -190,22 +217,48 @@ class AgentRulesPanel {
         );
     }
 
+    private _workspacePath(): string | undefined {
+        return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    }
+
+    private _statuses(files: RuleFile[]): FileStatus[] {
+        return files.map(({ file, state, lastModified, error, body }) => ({
+            file, state, lastModified, error,
+            inSync: state === 'present' ? body === this._baseline : undefined
+        }));
+    }
+
+    private _postStatuses() {
+        const workspace = this._workspacePath();
+        const files = workspace ? readRuleFiles(workspace, configuredRuleFiles()) : [];
+        this._panel.webview.postMessage({ command: 'fileStatuses', files: this._statuses(files) });
+    }
+
+    private async _handleSave(content: unknown) {
+        try {
+            if (typeof content !== 'string') throw new Error('Invalid save request');
+            await this._saveToAllFiles(content);
+        } catch (error) {
+            const message = `Saving agent rules failed: ${errorMessage(error)}`;
+            vscode.window.showErrorMessage(message);
+            this._panel.webview.postMessage({ command: 'saveResults', error: message, results: [] });
+        }
+    }
+
     /**
-     * Save the provided content to all configured agent rule files
-     * This is the core sync functionality - writes same content to multiple files
+     * Write the shared rules body to every configured file, keeping each file's own frontmatter.
      */
     private async _saveToAllFiles(content: string) {
-        // Get list of configured rule files from workspace settings
-        const config = vscode.workspace.getConfiguration('agentRulesSync');
-        const syncedFiles = config.get<string[]>('ruleFiles', []);
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        const syncedFiles = configuredRuleFiles();
+        const workspace = this._workspacePath();
 
-        if (!workspaceFolder) {
-            vscode.window.showErrorMessage('No workspace folder found');
+        if (!workspace) {
+            const error = 'No workspace folder found';
+            vscode.window.showErrorMessage(error);
             this._panel.webview.postMessage({
                 command: 'saveResults',
-                error: 'No workspace folder found',
-                results: syncedFiles.map(file => ({ file, success: false, error: 'No workspace folder found' }))
+                error,
+                results: syncedFiles.map(file => ({ file, success: false, error }))
             });
             return;
         }
@@ -217,36 +270,37 @@ class AgentRulesPanel {
             return;
         }
 
-        // Track results for each file save operation
-        const results: { file: string; success: boolean; error?: string }[] = [];
-
-        // Attempt to save content to each configured file
-        for (const filePath of syncedFiles) {
-            try {
-                const fullPath = ruleFilePath(workspaceFolder.uri.fsPath, filePath);
-                const dir = path.dirname(fullPath);
-                
-                // Create directory structure if it doesn't exist (e.g., .cursor/rules/)
-                if (!fs.existsSync(dir)) {
-                    fs.mkdirSync(dir, { recursive: true });
-                }
-
-                // Write the content to the file
-                fs.writeFileSync(fullPath, content, 'utf8');
-                results.push({ file: filePath, success: true });
-            } catch (error) {
-                // Record any errors for user feedback
-                results.push({ 
-                    file: filePath, 
-                    success: false, 
-                    error: error instanceof Error ? error.message : 'Unknown error'
-                });
+        const files = readRuleFiles(workspace, syncedFiles);
+        const diverged = files.filter(f => f.state === 'present' && f.body !== this._baseline && f.body !== content);
+        if (diverged.length > 0) {
+            const overwrite = 'Overwrite';
+            const choice = await vscode.window.showWarningMessage(
+                `These rule files have content that differs from the loaded rules and will be overwritten: ${diverged.map(f => f.file).join(', ')}`,
+                { modal: true },
+                overwrite
+            );
+            if (choice !== overwrite) {
+                this._panel.webview.postMessage({ command: 'saveResults', error: 'Save cancelled', results: [] });
+                this._postStatuses();
+                return;
             }
         }
 
-        // Provide user feedback about save results
+        const results: SaveResult[] = files.map(f => {
+            if (!f.fullPath || f.state === 'error') return { file: f.file, success: false, error: f.error };
+            try {
+                // Creates missing directories such as .cursor/rules/
+                fs.mkdirSync(path.dirname(f.fullPath), { recursive: true });
+                fs.writeFileSync(f.fullPath, (f.frontmatter ?? '') + content, 'utf8');
+                return { file: f.file, success: true };
+            } catch (error) {
+                return { file: f.file, success: false, error: errorMessage(error) };
+            }
+        });
+
         const successful = results.filter(r => r.success).length;
         const failed = results.filter(r => !r.success);
+        if (successful > 0) this._baseline = content;
 
         if (failed.length === 0) {
             vscode.window.showInformationMessage(`Successfully saved to ${successful} file(s)`);
@@ -255,104 +309,45 @@ class AgentRulesPanel {
             vscode.window.showErrorMessage(`Saved to ${successful} file(s), failed to save ${failed.length} file(s):\n${failedFiles}`);
         }
 
-        // Send results back to webview for UI updates
-        this._panel.webview.postMessage({
-            command: 'saveResults',
-            results: results
-        });
+        this._panel.webview.postMessage({ command: 'saveResults', results });
+        this._postStatuses();
     }
 
     /**
-     * Load content from the first available agent rule file
-     * This determines the "source of truth" - first existing file in the list wins
+     * Load the rules body from the first existing file; it is the source of truth.
      */
-    private async _loadContent() {
-        // Get configured rule files and workspace info
-        const config = vscode.workspace.getConfiguration('agentRulesSync');
-        const syncedFiles = config.get<string[]>('ruleFiles', []);
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    private _loadContent() {
+        const workspace = this._workspacePath();
+        const files = workspace ? readRuleFiles(workspace, configuredRuleFiles()) : [];
+        const source = files.find(f => f.state === 'present');
+        this._baseline = source?.body ?? '';
 
-        if (!workspaceFolder) {
-            // No workspace - send empty content to webview
-            this._panel.webview.postMessage({
-                command: 'loadContent',
-                content: '',
-                files: []
-            });
-            return;
-        }
-
-        let content = '';
-        const fileStatuses: { file: string; exists: boolean; lastModified?: string }[] = [];
-
-        // Load from the first readable file, but report every configured file once.
-        let contentLoaded = false;
-        for (const filePath of syncedFiles) {
-            try {
-                const fullPath = ruleFilePath(workspaceFolder.uri.fsPath, filePath);
-                const stats = fs.statSync(fullPath);
-                if (!contentLoaded) {
-                    content = fs.readFileSync(fullPath, 'utf8');
-                    contentLoaded = true;
-                }
-                fileStatuses.push({
-                    file: filePath,
-                    exists: true,
-                    lastModified: stats.mtime.toISOString()
-                });
-            } catch (error) {
-                fileStatuses.push({ file: filePath, exists: false });
-            }
-        }
-
-        // Send loaded content and file statuses to webview for display
         this._panel.webview.postMessage({
             command: 'loadContent',
-            content: content,
-            files: fileStatuses
+            content: this._baseline,
+            source: source?.file,
+            files: this._statuses(files)
         });
     }
 
-    /**
-     * Clean up resources when the panel is closed
-     * This prevents memory leaks and properly disposes of event listeners
-     */
     public dispose() {
-        // Clear the singleton reference
         AgentRulesPanel.currentPanel = undefined;
-
-        // Dispose the webview panel
         this._panel.dispose();
-
-        // Dispose all event listeners and other disposables
         while (this._disposables.length) {
-            const x = this._disposables.pop();
-            if (x) {
-                x.dispose();
-            }
+            this._disposables.pop()?.dispose();
         }
     }
 
-    /**
-     * Update the webview content with fresh HTML
-     * Called once when panel is created
-     */
-    private _update() {
-        this._panel.webview.html = this._getHtmlForWebview();
-    }
-
-    /**
-     * Generate the HTML content for the webview
-     * This creates the entire user interface with embedded CSS and JavaScript
-     */
     private _getHtmlForWebview() {
+        const nonce = crypto.randomBytes(16).toString('base64');
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Agent Rules Editor</title>
-    <style>
+    <style nonce="${nonce}">
         /* CSS using VS Code theme variables for consistent styling */
         body {
             font-family: var(--vscode-font-family);
@@ -363,26 +358,26 @@ class AgentRulesPanel {
             height: 100vh;
             box-sizing: border-box;
         }
-        
+
         .header {
             margin-bottom: 20px;
             padding-bottom: 15px;
             border-bottom: 1px solid var(--vscode-panel-border);
         }
-        
+
         .title {
             font-size: 24px;
             font-weight: bold;
             margin-bottom: 10px;
         }
-        
+
         .file-list {
             display: flex;
             flex-wrap: wrap;
             gap: 10px;
             margin-bottom: 15px;
         }
-        
+
         .file-status {
             padding: 4px 8px;
             border-radius: 4px;
@@ -390,24 +385,19 @@ class AgentRulesPanel {
             display: flex;
             align-items: center;
             gap: 5px;
+            color: var(--vscode-terminal-background);
         }
-        
-                 .file-exists {
-             background-color: var(--vscode-terminal-ansiGreen);
-             color: var(--vscode-terminal-background);
-         }
-         
-         .file-missing {
-             background-color: var(--vscode-terminal-ansiRed);
-             color: var(--vscode-terminal-background);
-         }
-        
+
+        .file-present { background-color: var(--vscode-terminal-ansiGreen); }
+        .file-diverged { background-color: var(--vscode-terminal-ansiYellow); }
+        .file-missing, .file-error { background-color: var(--vscode-terminal-ansiRed); }
+
         .controls {
             margin-bottom: 15px;
             display: flex;
             gap: 10px;
         }
-        
+
         .button {
             background-color: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
@@ -417,27 +407,28 @@ class AgentRulesPanel {
             cursor: pointer;
             font-size: 14px;
         }
-        
+
         .button:hover {
             background-color: var(--vscode-button-hoverBackground);
         }
-        
+
         .button:disabled {
             opacity: 0.5;
             cursor: not-allowed;
         }
-        
+
         .editor-container {
             flex: 1;
             display: flex;
             flex-direction: column;
             min-height: 0;
         }
-        
+
         .editor {
             flex: 1;
             width: 100%;
             min-height: 400px;
+            box-sizing: border-box;
             background-color: var(--vscode-input-background);
             color: var(--vscode-input-foreground);
             border: 1px solid var(--vscode-input-border);
@@ -447,29 +438,19 @@ class AgentRulesPanel {
             font-size: var(--vscode-editor-font-size);
             resize: vertical;
         }
-        
+
         .status {
             margin-top: 10px;
             padding: 8px;
             border-radius: 4px;
             font-size: 12px;
+            color: var(--vscode-terminal-background);
         }
-        
-                 .status.success {
-             background-color: var(--vscode-terminal-ansiGreen);
-             color: var(--vscode-terminal-background);
-         }
-         
-         .status.error {
-             background-color: var(--vscode-terminal-ansiRed);
-             color: var(--vscode-terminal-background);
-         }
-         
-         .status.info {
-             background-color: var(--vscode-terminal-ansiBlue);
-             color: var(--vscode-terminal-background);
-         }
-        
+
+        .status.success { background-color: var(--vscode-terminal-ansiGreen); }
+        .status.error { background-color: var(--vscode-terminal-ansiRed); }
+        .status.info { background-color: var(--vscode-terminal-ansiBlue); }
+
         .container {
             display: flex;
             flex-direction: column;
@@ -481,92 +462,93 @@ class AgentRulesPanel {
     <div class="container">
         <div class="header">
             <div class="title">Agent Rules Editor</div>
-            <div class="file-list" id="fileList">
-                <!-- File status badges will be inserted here -->
-            </div>
+            <div class="file-list" id="fileList"></div>
         </div>
-        
-                 <div class="controls">
-             <button class="button" id="loadBtn">Load Rules</button>
-             <button class="button" id="saveBtn">Save to All Rule Files</button>
-         </div>
-        
+
+        <div class="controls">
+            <button class="button" id="loadBtn">Load Rules</button>
+            <button class="button" id="saveBtn">Save to All Rule Files</button>
+        </div>
+
         <div class="editor-container">
-                         <textarea class="editor" id="editor" placeholder="Agent rules will appear here when loaded..."></textarea>
+            <textarea class="editor" id="editor" placeholder="Agent rules will appear here when loaded..."></textarea>
         </div>
-        
-        <div id="status" class="status" style="display: none;"></div>
+
+        <div id="status" class="status" hidden></div>
     </div>
 
-    <script>
-        // JavaScript for webview interaction with VS Code extension
-        // acquireVsCodeApi() provides communication bridge between webview and extension
+    <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
         const editor = document.getElementById('editor');
         const loadBtn = document.getElementById('loadBtn');
         const saveBtn = document.getElementById('saveBtn');
         const statusDiv = document.getElementById('status');
         const fileListDiv = document.getElementById('fileList');
+        let statusTimer;
 
-        // Helper function to show temporary status messages
         function showStatus(message, type = 'info') {
             statusDiv.textContent = message;
             statusDiv.className = 'status ' + type;
-            statusDiv.style.display = 'block';
-            setTimeout(() => {
-                statusDiv.style.display = 'none';
-            }, 5000);
+            statusDiv.hidden = false;
+            clearTimeout(statusTimer);
+            statusTimer = setTimeout(() => { statusDiv.hidden = true; }, 5000);
         }
 
-        // Helper function to update the file status badges at the top
+        // File names come from settings, so they are only ever rendered as text.
+        function badgeText(file) {
+            switch (file.state) {
+                case 'present':
+                    return (file.inSync ? '✓ ' : '≠ ') + file.file +
+                        (file.inSync ? '' : ' (differs)') +
+                        (file.lastModified ? ' (' + new Date(file.lastModified).toLocaleString() + ')' : '');
+                case 'missing':
+                    return '✗ ' + file.file + ' (missing)';
+                default:
+                    return '⚠ ' + file.file + ': ' + file.error;
+            }
+        }
+
         function updateFileList(files) {
-            fileListDiv.innerHTML = '';
+            fileListDiv.replaceChildren();
             files.forEach(file => {
                 const badge = document.createElement('div');
-                badge.className = 'file-status ' + (file.exists ? 'file-exists' : 'file-missing');
-                badge.textContent = file.exists
-                    ? '✓ ' + file.file + (file.lastModified ? ' (' + new Date(file.lastModified).toLocaleString() + ')' : '')
-                    : '✗ ' + file.file + ' (missing)';
+                const kind = file.state === 'present' && !file.inSync ? 'diverged' : file.state;
+                badge.className = 'file-status file-' + kind;
+                badge.textContent = badgeText(file);
                 fileListDiv.appendChild(badge);
             });
         }
 
-                // Event listeners for button clicks
         loadBtn.addEventListener('click', () => {
             loadBtn.disabled = true;
-            // Send message to extension backend to load content
             vscode.postMessage({ command: 'load' });
         });
 
         saveBtn.addEventListener('click', () => {
-            const content = editor.value;
             saveBtn.disabled = true;
-            // Send message to extension backend to save content to all files
-            vscode.postMessage({ 
-                command: 'save', 
-                content: content 
-            });
+            vscode.postMessage({ command: 'save', content: editor.value });
         });
 
-        // Listen for messages from the extension backend
         window.addEventListener('message', event => {
             const message = event.data;
-            
+
             switch (message.command) {
                 case 'loadContent':
-                    // Backend sent us content and file statuses
                     editor.value = message.content;
                     updateFileList(message.files);
                     loadBtn.disabled = false;
-                    if (message.content) {
-                        showStatus('Agent rules loaded successfully', 'success');
+                    if (message.source) {
+                        showStatus('Agent rules loaded from ' + message.source, 'success');
                     } else {
                         showStatus('No existing agent rules found', 'info');
                     }
                     break;
-                    
-                case 'saveResults':
-                    // Backend sent us save operation results
+
+                case 'fileStatuses':
+                    updateFileList(message.files);
+                    break;
+
+                case 'saveResults': {
                     saveBtn.disabled = false;
                     if (message.error) {
                         showStatus(message.error, 'error');
@@ -574,13 +556,14 @@ class AgentRulesPanel {
                     }
                     const successful = message.results.filter(r => r.success).length;
                     const failed = message.results.filter(r => !r.success).length;
-                    
+
                     if (failed === 0) {
                         showStatus('Successfully saved to ' + successful + ' file(s)', 'success');
                     } else {
                         showStatus('Saved to ' + successful + ' file(s), failed ' + failed + ' file(s)', 'error');
                     }
                     break;
+                }
             }
         });
 
@@ -591,9 +574,3 @@ class AgentRulesPanel {
 </html>`;
     }
 }
-
-/**
- * Extension deactivation function - called when the extension is deactivated
- * Currently no cleanup is needed as VS Code handles disposing of our command registrations
- */
-export function deactivate() {}
