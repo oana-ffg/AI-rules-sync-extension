@@ -34,7 +34,7 @@ const vscode = {
         createStatusBarItem() { return { show() {}, dispose() {} }; },
         showErrorMessage() {},
         showInformationMessage() {},
-        async showWarningMessage(message) { warnings.push(message); return warningChoice; },
+        async showWarningMessage(message) { warnings.push(message); return typeof warningChoice === 'function' ? warningChoice() : warningChoice; },
         async showInputBox(options) { return inputBox(options); },
         createWebviewPanel(viewType, title, column, options) {
             panel = {
@@ -326,5 +326,60 @@ test('refreshes file statuses when the panel becomes visible again', async (t) =
         panel.onViewState({ webviewPanel: { visible: true } });
         assert.equal(panel.messages.at(-1).command, 'fileStatuses');
         assert.equal(panel.messages.at(-1).files[0].inSync, false);
+    });
+});
+
+test('re-validates paths after confirmation so a symlink swapped in meanwhile is not followed', async (t) => {
+    await withPanel(t, { 'AGENTS.md': 'shared', 'CLAUDE.md': 'claude only' }, async (panel) => {
+        const outside = path.join(path.dirname(workspaceFolder), 'outside.md');
+        fs.writeFileSync(outside, 'outside original');
+        await panel.receive({ command: 'load' });
+        warningChoice = () => {
+            fs.rmSync(path.join(workspaceFolder, 'AGENTS.md'));
+            fs.symlinkSync(outside, path.join(workspaceFolder, 'AGENTS.md'));
+            return 'Overwrite';
+        };
+        await panel.receive({ command: 'save', content: 'edited' });
+        assert.equal(fs.readFileSync(outside, 'utf8'), 'outside original');
+        const saved = panel.messages.find((message) => message.command === 'saveResults');
+        assert.deepEqual(saved.results.map((result) => [result.file, result.success]), [['AGENTS.md', false], ['CLAUDE.md', true]]);
+    });
+});
+
+test('asks again for files that start to differ while the confirmation is open', async (t) => {
+    await withPanel(t, { 'AGENTS.md': 'shared', 'CLAUDE.md': 'claude only' }, async (panel) => {
+        await panel.receive({ command: 'load' });
+        const choices = [
+            () => { fs.writeFileSync(path.join(workspaceFolder, 'AGENTS.md'), 'edited meanwhile'); return 'Overwrite'; },
+            () => undefined,
+        ];
+        warningChoice = () => choices.shift()();
+        await panel.receive({ command: 'save', content: 'edited' });
+        assert.equal(warnings.length, 2);
+        assert.match(warnings[1], /AGENTS\.md/);
+        assert.doesNotMatch(warnings[1], /CLAUDE\.md/);
+        assert.equal(panel.messages.at(-2).error, 'Save cancelled');
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'AGENTS.md'), 'utf8'), 'edited meanwhile');
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'CLAUDE.md'), 'utf8'), 'claude only');
+    });
+});
+
+test('keeps a newline after frontmatter that ended the file', async (t) => {
+    await withPanel(t, { 'rules.mdc': '---\nalwaysApply: true\n---' }, async (panel) => {
+        await panel.receive({ command: 'load' });
+        assert.equal(panel.messages.at(-1).content, '');
+        await panel.receive({ command: 'save', content: 'new rules' });
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'rules.mdc'), 'utf8'), '---\nalwaysApply: true\n---\nnew rules');
+    });
+});
+
+test('keeps a byte order mark and its frontmatter with their own file', async (t) => {
+    await withPanel(t, { 'rules.mdc': '\uFEFF---\nalwaysApply: true\n---\nshared', 'AGENTS.md': 'shared' }, async (panel) => {
+        await panel.receive({ command: 'load' });
+        assert.equal(panel.messages.at(-1).content, 'shared');
+        await panel.receive({ command: 'save', content: 'new rules' });
+        assert.deepEqual(warnings, []);
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'rules.mdc'), 'utf8'), '\uFEFF---\nalwaysApply: true\n---\nnew rules');
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'AGENTS.md'), 'utf8'), 'new rules');
     });
 });

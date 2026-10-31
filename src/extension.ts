@@ -47,12 +47,16 @@ function ruleFilePath(workspace: string, file: string): string {
 }
 
 // YAML frontmatter (e.g. Cursor's `alwaysApply`) configures one tool's file, so it is
-// kept per file and never copied into the shared rules body.
+// kept per file and never copied into the shared rules body. A leading BOM is kept with it.
 function splitFrontmatter(text: string): { frontmatter: string; body: string } {
-    const match = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(text);
-    return match
-        ? { frontmatter: match[0], body: text.slice(match[0].length) }
-        : { frontmatter: '', body: text };
+    const [frontmatter] = /^﻿?(?:---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$))?/.exec(text)!;
+    return { frontmatter, body: text.slice(frontmatter.length) };
+}
+
+function joinFrontmatter(frontmatter: string, body: string): string {
+    // Frontmatter that ended the file has no newline after its closing fence.
+    const separator = frontmatter.endsWith('---') ? (frontmatter.includes('\r\n') ? '\r\n' : '\n') : '';
+    return frontmatter + separator + body;
 }
 
 function errorMessage(error: unknown): string {
@@ -270,9 +274,14 @@ class AgentRulesPanel {
             return;
         }
 
-        const files = readRuleFiles(workspace, syncedFiles);
-        const diverged = files.filter(f => f.state === 'present' && f.body !== this._baseline && f.body !== content);
-        if (diverged.length > 0) {
+        // Files can change, or be swapped for symlinks, while the confirmation is open,
+        // so re-read and re-validate after each one and write only from the latest read.
+        const confirmed = new Set<string>();
+        let files = readRuleFiles(workspace, syncedFiles);
+        while (true) {
+            const diverged = files.filter(f => f.state === 'present' && !confirmed.has(f.file) &&
+                f.body !== this._baseline && f.body !== content);
+            if (diverged.length === 0) break;
             const overwrite = 'Overwrite';
             const choice = await vscode.window.showWarningMessage(
                 `These rule files have content that differs from the loaded rules and will be overwritten: ${diverged.map(f => f.file).join(', ')}`,
@@ -284,6 +293,8 @@ class AgentRulesPanel {
                 this._postStatuses();
                 return;
             }
+            diverged.forEach(f => confirmed.add(f.file));
+            files = readRuleFiles(workspace, syncedFiles);
         }
 
         const results: SaveResult[] = files.map(f => {
@@ -291,7 +302,7 @@ class AgentRulesPanel {
             try {
                 // Creates missing directories such as .cursor/rules/
                 fs.mkdirSync(path.dirname(f.fullPath), { recursive: true });
-                fs.writeFileSync(f.fullPath, (f.frontmatter ?? '') + content, 'utf8');
+                fs.writeFileSync(f.fullPath, joinFrontmatter(f.frontmatter ?? '', content), 'utf8');
                 return { file: f.file, success: true };
             } catch (error) {
                 return { file: f.file, success: false, error: errorMessage(error) };
