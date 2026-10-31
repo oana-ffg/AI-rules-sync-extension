@@ -90,6 +90,10 @@ In [Restricted Mode](https://code.visualstudio.com/docs/editor/workspace-trust),
 
 This is perfect for keeping your coding agent instructions synchronized across different AI tools and platforms - whether you're using Claude, Cursor, GitHub Copilot, Windsurf, or other AI coding assistants.
 
+## See Also
+
+Want to sync agent skills and global instructions (such as `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`) across every machine and agent? Check out [Ratatoskr Skill Sync](https://firefungames.com/projects/ratatoskr), also by FireFun Games.
+
 ## Installation
 
 Install **Agent Rules Sync** from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=FireFunGames.agent-rules-sync), or from a VSIX file:
