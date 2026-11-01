@@ -11,7 +11,7 @@ type FileStatus = {
     error?: string;
 };
 
-type RuleFile = FileStatus & { fullPath?: string; frontmatter?: string; body?: string };
+type RuleFile = FileStatus & { fullPath?: string; frontmatter?: string; body?: string; text?: string };
 
 type SaveResult = { file: string; success: boolean; error?: string };
 
@@ -77,8 +77,9 @@ function readRuleFiles(workspace: string, files: string[]): RuleFile[] {
         }
         try {
             const stats = fs.statSync(fullPath);
-            const { frontmatter, body } = splitFrontmatter(fs.readFileSync(fullPath, 'utf8'));
-            return { file, state: 'present', fullPath, frontmatter, body, lastModified: stats.mtime.toISOString() };
+            const text = fs.readFileSync(fullPath, 'utf8');
+            const { frontmatter, body } = splitFrontmatter(text);
+            return { file, state: 'present', fullPath, frontmatter, body, text, lastModified: stats.mtime.toISOString() };
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { file, state: 'missing', fullPath };
             return { file, state: 'error', error: errorMessage(error) };
@@ -300,9 +301,13 @@ class AgentRulesPanel {
         const results: SaveResult[] = files.map(f => {
             if (!f.fullPath || f.state === 'error') return { file: f.file, success: false, error: f.error };
             try {
-                // Creates missing directories such as .cursor/rules/
-                fs.mkdirSync(path.dirname(f.fullPath), { recursive: true });
-                fs.writeFileSync(f.fullPath, joinFrontmatter(f.frontmatter ?? '', content), 'utf8');
+                const text = joinFrontmatter(f.frontmatter ?? '', content);
+                // Leave identical bytes and mtimes untouched, avoiding unnecessary watcher events.
+                if (f.state === 'present' && f.text === text) return { file: f.file, success: true };
+                if (f.state === 'missing') {
+                    fs.mkdirSync(path.dirname(f.fullPath), { recursive: true });
+                }
+                fs.writeFileSync(f.fullPath, text, 'utf8');
                 return { file: f.file, success: true };
             } catch (error) {
                 return { file: f.file, success: false, error: errorMessage(error) };

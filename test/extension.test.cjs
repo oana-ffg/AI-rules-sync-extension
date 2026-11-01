@@ -383,3 +383,74 @@ test('keeps a byte order mark and its frontmatter with their own file', async (t
         assert.equal(fs.readFileSync(path.join(workspaceFolder, 'AGENTS.md'), 'utf8'), 'new rules');
     });
 });
+
+async function countWrites(t, operation) {
+    const counts = { writes: 0, writtenBytes: 0, mkdir: 0 };
+    const writeFile = fs.writeFileSync;
+    const mkdir = fs.mkdirSync;
+    const writeMock = t.mock.method(fs, 'writeFileSync', function (...args) {
+        counts.writes++;
+        counts.writtenBytes += Buffer.byteLength(args[1]);
+        return writeFile.apply(this, args);
+    });
+    const mkdirMock = t.mock.method(fs, 'mkdirSync', function (...args) {
+        counts.mkdir++;
+        return mkdir.apply(this, args);
+    });
+    try {
+        await operation();
+        return counts;
+    } finally {
+        writeMock.mock.restore();
+        mkdirMock.mock.restore();
+    }
+}
+
+test('saving unchanged default rule files performs no writes or mkdirs in a large workspace', async (t) => {
+    const defaults = require('../package.json').contributes.configuration.properties['agentRulesSync.ruleFiles'].default;
+    const body = 'shared rules\n'.repeat(1024).slice(0, 8192);
+    await withPanel(t, Object.fromEntries(defaults.map(file => [file, body])), async (panel) => {
+        // Unrelated source files should not contribute any work to a manual sync.
+        for (let i = 0; i < 4096; i++) fs.writeFileSync(path.join(workspaceFolder, `source-${i}.txt`), 'unrelated');
+        await panel.receive({ command: 'load' });
+        const unchanged = await countWrites(t, () => panel.receive({ command: 'save', content: body }));
+        assert.deepEqual(unchanged, { writes: 0, writtenBytes: 0, mkdir: 0 });
+        assert.ok(panel.messages.at(-2).results.every(result => result.success));
+
+        const changed = await countWrites(t, () => panel.receive({ command: 'save', content: body + 'edit\n' }));
+        assert.deepEqual(changed, { writes: defaults.length, writtenBytes: defaults.length * (8192 + 5), mkdir: 0 });
+        const repeated = await countWrites(t, () => panel.receive({ command: 'save', content: body + 'edit\n' }));
+        assert.deepEqual(repeated, { writes: 0, writtenBytes: 0, mkdir: 0 });
+    });
+});
+
+test('writes only changed or missing files and preserves byte-identical frontmatter and mtimes', async (t) => {
+    const unchanged = '\uFEFF---\r\nalwaysApply: true\r\n---\r\ndesired';
+    await withPanel(t, { 'rules.mdc': unchanged, 'old.md': 'old', 'new/rules.md': null }, async (panel) => {
+        const target = path.join(workspaceFolder, 'rules.mdc');
+        fs.utimesSync(target, new Date(1000000), new Date(1000000));
+        const before = fs.statSync(target).mtimeMs;
+        await panel.receive({ command: 'load' });
+        warningChoice = 'Overwrite';
+        const counts = await countWrites(t, () => panel.receive({ command: 'save', content: 'desired' }));
+        assert.equal(counts.writes, 2);
+        assert.equal(counts.mkdir, 1);
+        assert.equal(fs.statSync(target).mtimeMs, before);
+        assert.equal(fs.readFileSync(target, 'utf8'), unchanged);
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'old.md'), 'utf8'), 'desired');
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'new/rules.md'), 'utf8'), 'desired');
+        assert.ok(panel.messages.at(-2).results.every(result => result.success));
+    });
+});
+
+test('still writes a frontmatter separator when the old closing fence ended the file', async (t) => {
+    const original = '---\nalwaysApply: true\n---';
+    await withPanel(t, { 'rules.mdc': original }, async (panel) => {
+        await panel.receive({ command: 'load' });
+        const first = await countWrites(t, () => panel.receive({ command: 'save', content: '' }));
+        assert.equal(first.writes, 1);
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'rules.mdc'), 'utf8'), original + '\n');
+        const second = await countWrites(t, () => panel.receive({ command: 'save', content: '' }));
+        assert.equal(second.writes, 0);
+    });
+});
