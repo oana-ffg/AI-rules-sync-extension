@@ -11,17 +11,17 @@ type FileStatus = {
     error?: string;
 };
 
-type RuleFile = FileStatus & { fullPath?: string; frontmatter?: string; body?: string };
+type RuleFile = FileStatus & { fullPath?: string; frontmatter?: string; body?: string; text?: string };
 
 type SaveResult = { file: string; success: boolean; error?: string };
 
 // Resolve both lexical paths and symlink targets before reading or writing.
 // Missing descendants are allowed only beneath a real directory in the workspace.
-function ruleFilePath(workspace: string, file: string): string {
+async function ruleFilePath(workspace: string, file: string): Promise<string> {
     if (!file || path.isAbsolute(file) || path.win32.isAbsolute(file)) {
         throw new Error('Rule file must be a relative path inside the workspace');
     }
-    const root = fs.realpathSync(workspace);
+    const root = await fs.promises.realpath(workspace);
     const target = path.resolve(root, file);
     const isInside = (candidate: string) => {
         const relative = path.relative(root, candidate);
@@ -32,14 +32,14 @@ function ruleFilePath(workspace: string, file: string): string {
     let existing = target;
     while (true) {
         try {
-            fs.lstatSync(existing);
+            await fs.promises.lstat(existing);
             break;
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
             existing = path.dirname(existing);
         }
     }
-    const real = fs.realpathSync(existing);
+    const real = await fs.promises.realpath(existing);
     if (real !== root && !isInside(real)) {
         throw new Error('Rule file symlink points outside the workspace');
     }
@@ -67,23 +67,33 @@ function configuredRuleFiles(): string[] {
     return vscode.workspace.getConfiguration('agentRulesSync').get<string[]>('ruleFiles', []);
 }
 
-function readRuleFiles(workspace: string, files: string[]): RuleFile[] {
-    return files.map((file): RuleFile => {
-        let fullPath: string;
-        try {
-            fullPath = ruleFilePath(workspace, file);
-        } catch (error) {
-            return { file, state: 'error', error: errorMessage(error) };
-        }
-        try {
-            const stats = fs.statSync(fullPath);
-            const { frontmatter, body } = splitFrontmatter(fs.readFileSync(fullPath, 'utf8'));
-            return { file, state: 'present', fullPath, frontmatter, body, lastModified: stats.mtime.toISOString() };
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { file, state: 'missing', fullPath };
-            return { file, state: 'error', error: errorMessage(error) };
-        }
-    });
+async function readRuleFiles(workspace: string, files: string[]): Promise<RuleFile[]> {
+    const results: RuleFile[] = [];
+    // Small batches keep the host responsive without flooding the filesystem queue.
+    const batchSize = 8;
+    for (let start = 0; start < files.length; start += batchSize) {
+        results.push(...await Promise.all(files.slice(start, start + batchSize)
+            .map(file => readRuleFile(workspace, file))));
+    }
+    return results;
+}
+
+async function readRuleFile(workspace: string, file: string): Promise<RuleFile> {
+    let fullPath: string;
+    try {
+        fullPath = await ruleFilePath(workspace, file);
+    } catch (error) {
+        return { file, state: 'error', error: errorMessage(error) };
+    }
+    try {
+        const stats = await fs.promises.stat(fullPath);
+        const text = await fs.promises.readFile(fullPath, 'utf8');
+        const { frontmatter, body } = splitFrontmatter(text);
+        return { file, state: 'present', fullPath, frontmatter, body, text, lastModified: stats.mtime.toISOString() };
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { file, state: 'missing', fullPath };
+        return { file, state: 'error', error: errorMessage(error) };
+    }
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -107,10 +117,10 @@ export function activate(context: vscode.ExtensionContext) {
         const input = await vscode.window.showInputBox({
             prompt: 'Enter agent rule file path to add',
             placeHolder: 'e.g., .github/copilot-instructions.md',
-            validateInput: (value) => {
+            validateInput: async (value) => {
                 if (!value.trim()) return undefined;
                 try {
-                    ruleFilePath(workspaceFolder.uri.fsPath, value.trim());
+                    await ruleFilePath(workspaceFolder.uri.fsPath, value.trim());
                     return undefined;
                 } catch (error) {
                     return errorMessage(error);
@@ -165,6 +175,9 @@ class AgentRulesPanel {
     private _disposables: vscode.Disposable[] = [];
     // Rules body as last loaded or saved; files that drift from it need confirmation to overwrite.
     private _baseline: string | undefined;
+    private _busy = false;
+    private _refreshPending = false;
+    private _disposed = false;
 
     public static createOrShow() {
         const column = vscode.window.activeTextEditor?.viewColumn;
@@ -198,22 +211,17 @@ class AgentRulesPanel {
 
         // Rule files can change on disk while the panel is in the background.
         this._panel.onDidChangeViewState(event => {
-            if (event.webviewPanel.visible) this._postStatuses();
+            if (event.webviewPanel.visible) return this._runOperation('refresh');
         }, null, this._disposables);
 
         vscode.workspace.onDidChangeConfiguration(event => {
-            if (event.affectsConfiguration('agentRulesSync.ruleFiles')) this._postStatuses();
+            if (event.affectsConfiguration('agentRulesSync.ruleFiles')) return this._runOperation('refresh');
         }, null, this._disposables);
 
         this._panel.webview.onDidReceiveMessage(
             async (message) => {
-                switch (message?.command) {
-                    case 'save':
-                        await this._handleSave(message.content);
-                        break;
-                    case 'load':
-                        this._loadContent();
-                        break;
+                if (message?.command === 'load' || message?.command === 'save') {
+                    await this._runOperation(message.command, message.content);
                 }
             },
             null,
@@ -232,20 +240,46 @@ class AgentRulesPanel {
         }));
     }
 
-    private _postStatuses() {
+    private async _postStatuses() {
         const workspace = this._workspacePath();
-        const files = workspace ? readRuleFiles(workspace, configuredRuleFiles()) : [];
+        const files = workspace ? await readRuleFiles(workspace, configuredRuleFiles()) : [];
         this._panel.webview.postMessage({ command: 'fileStatuses', files: this._statuses(files) });
     }
 
-    private async _handleSave(content: unknown) {
+    private async _runOperation(command: 'load' | 'save' | 'refresh', content?: unknown) {
+        if (this._disposed) return;
+        if (this._busy) {
+            if (command === 'refresh') {
+                // Keep one refresh request, rather than a queue of full file reads.
+                this._refreshPending = true;
+            } else {
+                vscode.window.showWarningMessage('Agent rules are busy. Try again when the current operation finishes.');
+            }
+            return;
+        }
+        this._busy = true;
         try {
-            if (typeof content !== 'string') throw new Error('Invalid save request');
-            await this._saveToAllFiles(content);
+            if (command === 'save') {
+                if (typeof content !== 'string') throw new Error('Invalid save request');
+                await this._saveToAllFiles(content);
+            } else if (command === 'load') {
+                await this._loadContent();
+            } else {
+                await this._postStatuses();
+            }
+            while (this._refreshPending && !this._disposed) {
+                this._refreshPending = false;
+                await this._postStatuses();
+            }
         } catch (error) {
-            const message = `Saving agent rules failed: ${errorMessage(error)}`;
+            const message = `${command === 'save' ? 'Saving' : 'Reading'} agent rules failed: ${errorMessage(error)}`;
             vscode.window.showErrorMessage(message);
-            this._panel.webview.postMessage({ command: 'saveResults', error: message, results: [] });
+            this._panel.webview.postMessage({
+                command: command === 'save' ? 'saveResults' : 'loadError', error: message, results: []
+            });
+        } finally {
+            this._busy = false;
+            this._refreshPending = false;
         }
     }
 
@@ -277,7 +311,7 @@ class AgentRulesPanel {
         // Files can change, or be swapped for symlinks, while the confirmation is open,
         // so re-read and re-validate after each one and write only from the latest read.
         const confirmed = new Set<string>();
-        let files = readRuleFiles(workspace, syncedFiles);
+        let files = await readRuleFiles(workspace, syncedFiles);
         while (true) {
             const diverged = files.filter(f => f.state === 'present' && !confirmed.has(f.file) &&
                 f.body !== this._baseline && f.body !== content);
@@ -289,25 +323,35 @@ class AgentRulesPanel {
                 overwrite
             );
             if (choice !== overwrite) {
-                this._panel.webview.postMessage({ command: 'saveResults', error: 'Save cancelled', results: [] });
-                this._postStatuses();
+                this._panel.webview.postMessage({ command: 'saveResults', error: 'Save cancelled', results: [], busy: true });
+                await this._postStatuses();
                 return;
             }
             diverged.forEach(f => confirmed.add(f.file));
-            files = readRuleFiles(workspace, syncedFiles);
+            files = await readRuleFiles(workspace, syncedFiles);
         }
 
-        const results: SaveResult[] = files.map(f => {
-            if (!f.fullPath || f.state === 'error') return { file: f.file, success: false, error: f.error };
-            try {
-                // Creates missing directories such as .cursor/rules/
-                fs.mkdirSync(path.dirname(f.fullPath), { recursive: true });
-                fs.writeFileSync(f.fullPath, joinFrontmatter(f.frontmatter ?? '', content), 'utf8');
-                return { file: f.file, success: true };
-            } catch (error) {
-                return { file: f.file, success: false, error: errorMessage(error) };
+        const results: SaveResult[] = [];
+        for (const f of files) {
+            if (!f.fullPath || f.state === 'error') {
+                results.push({ file: f.file, success: false, error: f.error });
+                continue;
             }
-        });
+            try {
+                const text = joinFrontmatter(f.frontmatter ?? '', content);
+                // Identical bytes already count as saved. Preserve mtimes and avoid
+                // waking other extensions' watchers when there is nothing to change.
+                if (f.state !== 'present' || f.text !== text) {
+                    if (f.state === 'missing') {
+                        await fs.promises.mkdir(path.dirname(f.fullPath), { recursive: true });
+                    }
+                    await fs.promises.writeFile(f.fullPath, text, 'utf8');
+                }
+                results.push({ file: f.file, success: true });
+            } catch (error) {
+                results.push({ file: f.file, success: false, error: errorMessage(error) });
+            }
+        }
 
         const successful = results.filter(r => r.success).length;
         const failed = results.filter(r => !r.success);
@@ -320,16 +364,16 @@ class AgentRulesPanel {
             vscode.window.showErrorMessage(`Saved to ${successful} file(s), failed to save ${failed.length} file(s):\n${failedFiles}`);
         }
 
-        this._panel.webview.postMessage({ command: 'saveResults', results });
-        this._postStatuses();
+        this._panel.webview.postMessage({ command: 'saveResults', results, busy: true });
+        await this._postStatuses();
     }
 
     /**
      * Load the rules body from the first existing file; it is the source of truth.
      */
-    private _loadContent() {
+    private async _loadContent() {
         const workspace = this._workspacePath();
-        const files = workspace ? readRuleFiles(workspace, configuredRuleFiles()) : [];
+        const files = workspace ? await readRuleFiles(workspace, configuredRuleFiles()) : [];
         const source = files.find(f => f.state === 'present');
         this._baseline = source?.body ?? '';
 
@@ -342,6 +386,7 @@ class AgentRulesPanel {
     }
 
     public dispose() {
+        this._disposed = true;
         AgentRulesPanel.currentPanel = undefined;
         this._panel.dispose();
         while (this._disposables.length) {
@@ -530,13 +575,18 @@ class AgentRulesPanel {
             });
         }
 
+        function setBusy(busy) {
+            loadBtn.disabled = busy;
+            saveBtn.disabled = busy;
+        }
+
         loadBtn.addEventListener('click', () => {
-            loadBtn.disabled = true;
+            setBusy(true);
             vscode.postMessage({ command: 'load' });
         });
 
         saveBtn.addEventListener('click', () => {
-            saveBtn.disabled = true;
+            setBusy(true);
             vscode.postMessage({ command: 'save', content: editor.value });
         });
 
@@ -547,7 +597,7 @@ class AgentRulesPanel {
                 case 'loadContent':
                     editor.value = message.content;
                     updateFileList(message.files);
-                    loadBtn.disabled = false;
+                    setBusy(false);
                     if (message.source) {
                         showStatus('Agent rules loaded from ' + message.source, 'success');
                     } else {
@@ -557,10 +607,16 @@ class AgentRulesPanel {
 
                 case 'fileStatuses':
                     updateFileList(message.files);
+                    setBusy(false);
+                    break;
+
+                case 'loadError':
+                    setBusy(false);
+                    showStatus(message.error, 'error');
                     break;
 
                 case 'saveResults': {
-                    saveBtn.disabled = false;
+                    setBusy(message.busy ?? false);
                     if (message.error) {
                         showStatus(message.error, 'error');
                         break;
@@ -579,6 +635,7 @@ class AgentRulesPanel {
         });
 
         // Automatically load content when the panel first opens
+        setBusy(true);
         vscode.postMessage({ command: 'load' });
     </script>
 </body>

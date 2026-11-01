@@ -84,7 +84,7 @@ In [Restricted Mode](https://code.visualstudio.com/docs/editor/workspace-trust),
 ## How It Works
 
 1. **Rules Loading**: The extension reads agent rules from the first existing rule file in your list, without its frontmatter
-2. **Rules Saving**: When you save, the extension writes the same rules to all configured rule files, keeping each file's existing frontmatter
+2. **Rules Saving**: When you save, the extension writes the same rules to all configured rule files, keeping each file's existing frontmatter. Files whose complete content already matches are left untouched, preserving their modification times.
 3. **Directory Creation**: Missing directories are automatically created when saving rule files
 4. **File Status**: The interface shows which rule files exist and when they were last modified
 
