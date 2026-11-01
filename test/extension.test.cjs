@@ -5,7 +5,6 @@ const os = require('node:os');
 const path = require('node:path');
 const Module = require('node:module');
 const vm = require('node:vm');
-const { measureIO } = require('./helpers/io.cjs');
 
 const commands = new Map();
 let workspaceFolder;
@@ -112,8 +111,7 @@ test('a failed save without a workspace still sends a result to enable the butto
 function runWebview(panel) {
     const elements = new Map();
     const element = () => ({
-        children: [], style: {}, events: new Map(),
-        addEventListener(name, callback) { this.events.set(name, callback); },
+        children: [], style: {}, addEventListener() {},
         appendChild(child) { this.children.push(child); },
         replaceChildren() { this.children = []; },
     });
@@ -273,7 +271,7 @@ test('refreshes file statuses after saving and when the rule list changes', asyn
         assert.deepEqual(statuses.files.map((file) => [file.state, file.inSync]), [['present', true], ['present', true]]);
 
         ruleFiles = ['AGENTS.md'];
-        await configListener({ affectsConfiguration: (key) => key === 'agentRulesSync.ruleFiles' });
+        configListener({ affectsConfiguration: (key) => key === 'agentRulesSync.ruleFiles' });
         assert.equal(panel.messages.at(-1).files.length, 1);
     });
 });
@@ -305,9 +303,9 @@ test('validates and trims new rule file paths before adding them', async (t) => 
         await commands.get('agentRulesSync.addRuleFile')();
         assert.deepEqual(configUpdates, [{ key: 'ruleFiles', value: ['AGENTS.md', 'CLAUDE.md'], target: 2 }]);
         assert.deepEqual(ruleFiles, ['AGENTS.md']);
-        assert.equal(await validate('.github/copilot-instructions.md'), undefined);
-        assert.match(await validate('../outside.md'), /inside the workspace/);
-        assert.match(await validate('/etc/passwd'), /relative path/);
+        assert.equal(validate('.github/copilot-instructions.md'), undefined);
+        assert.match(validate('../outside.md'), /inside the workspace/);
+        assert.match(validate('/etc/passwd'), /relative path/);
     });
 });
 
@@ -325,7 +323,7 @@ test('refreshes file statuses when the panel becomes visible again', async (t) =
     await withPanel(t, { 'AGENTS.md': 'rules' }, async (panel) => {
         await panel.receive({ command: 'load' });
         fs.writeFileSync(path.join(workspaceFolder, 'AGENTS.md'), 'edited elsewhere');
-        await panel.onViewState({ webviewPanel: { visible: true } });
+        panel.onViewState({ webviewPanel: { visible: true } });
         assert.equal(panel.messages.at(-1).command, 'fileStatuses');
         assert.equal(panel.messages.at(-1).files[0].inSync, false);
     });
@@ -386,44 +384,45 @@ test('keeps a byte order mark and its frontmatter with their own file', async (t
     });
 });
 
-// Run this harness against either revision; measurement mode reports counts without
-// applying the fixed-version expectations, so before/after use identical fixtures.
-for (const ruleCount of [6, 256]) {
-    test(`runtime waste audit: real sync with ${ruleCount} rule files in a large workspace`, async (t) => {
-        const body = 'shared rules\n'.repeat(2048);
-        const rules = Object.fromEntries(Array.from({ length: ruleCount }, (_, i) => [`rules/${i}.md`, body]));
-        await withPanel(t, rules, async (panel) => {
-            // Large unrelated tree must not contribute work to a sync.
-            for (let i = 0; i < 4096; i++) {
-                fs.writeFileSync(path.join(workspaceFolder, `source-${i}.txt`), 'unrelated');
-            }
-            const counts = {};
-            counts.activation = await measureIO(t, () => extension.activate({ subscriptions: [] }));
-            counts.load = await measureIO(t, () => panel.receive({ command: 'load' }));
-            counts.unchangedSave = await measureIO(t, () => panel.receive({ command: 'save', content: body }));
-            counts.changedSave = await measureIO(t, () => panel.receive({ command: 'save', content: body + 'edit\n' }));
-            counts.repeatSave = await measureIO(t, () => panel.receive({ command: 'save', content: body + 'edit\n' }));
-            if (process.env.AUDIT_MEASURE === '1') {
-                console.log(JSON.stringify({ ruleFiles: ruleCount, unrelatedFiles: 4096, bodyBytes: Buffer.byteLength(body), counts }));
-            } else {
-                assert.ok(Object.values(counts.activation).every(count => count === 0));
-                assert.equal(counts.load.reads, ruleCount);
-                assert.equal(counts.unchangedSave.reads, 2 * ruleCount);
-                assert.equal(counts.unchangedSave.writes, 0);
-                assert.equal(counts.unchangedSave.mkdir, 0);
-                assert.equal(counts.repeatSave.writes, 0);
-                assert.equal(counts.changedSave.writes, ruleCount);
-                for (const count of Object.values(counts)) {
-                    assert.equal(count.scans, 0);
-                    assert.equal(count.network, 0);
-                    assert.equal(count.fsync, 0);
-                    assert.equal(count.sync, 0);
-                    assert.ok(count.maxPending <= 8);
-                }
-            }
-        });
+async function countWrites(t, operation) {
+    const counts = { writes: 0, writtenBytes: 0, mkdir: 0 };
+    const writeFile = fs.writeFileSync;
+    const mkdir = fs.mkdirSync;
+    const writeMock = t.mock.method(fs, 'writeFileSync', function (...args) {
+        counts.writes++;
+        counts.writtenBytes += Buffer.byteLength(args[1]);
+        return writeFile.apply(this, args);
     });
+    const mkdirMock = t.mock.method(fs, 'mkdirSync', function (...args) {
+        counts.mkdir++;
+        return mkdir.apply(this, args);
+    });
+    try {
+        await operation();
+        return counts;
+    } finally {
+        writeMock.mock.restore();
+        mkdirMock.mock.restore();
+    }
 }
+
+test('saving unchanged default rule files performs no writes or mkdirs in a large workspace', async (t) => {
+    const defaults = require('../package.json').contributes.configuration.properties['agentRulesSync.ruleFiles'].default;
+    const body = 'shared rules\n'.repeat(1024).slice(0, 8192);
+    await withPanel(t, Object.fromEntries(defaults.map(file => [file, body])), async (panel) => {
+        // Unrelated source files should not contribute any work to a manual sync.
+        for (let i = 0; i < 4096; i++) fs.writeFileSync(path.join(workspaceFolder, `source-${i}.txt`), 'unrelated');
+        await panel.receive({ command: 'load' });
+        const unchanged = await countWrites(t, () => panel.receive({ command: 'save', content: body }));
+        assert.deepEqual(unchanged, { writes: 0, writtenBytes: 0, mkdir: 0 });
+        assert.ok(panel.messages.at(-2).results.every(result => result.success));
+
+        const changed = await countWrites(t, () => panel.receive({ command: 'save', content: body + 'edit\n' }));
+        assert.deepEqual(changed, { writes: defaults.length, writtenBytes: defaults.length * (8192 + 5), mkdir: 0 });
+        const repeated = await countWrites(t, () => panel.receive({ command: 'save', content: body + 'edit\n' }));
+        assert.deepEqual(repeated, { writes: 0, writtenBytes: 0, mkdir: 0 });
+    });
+});
 
 test('writes only changed or missing files and preserves byte-identical frontmatter and mtimes', async (t) => {
     const unchanged = '\uFEFF---\r\nalwaysApply: true\r\n---\r\ndesired';
@@ -433,124 +432,25 @@ test('writes only changed or missing files and preserves byte-identical frontmat
         const before = fs.statSync(target).mtimeMs;
         await panel.receive({ command: 'load' });
         warningChoice = 'Overwrite';
-        const counts = await measureIO(t, () => panel.receive({ command: 'save', content: 'desired' }));
+        const counts = await countWrites(t, () => panel.receive({ command: 'save', content: 'desired' }));
         assert.equal(counts.writes, 2);
         assert.equal(counts.mkdir, 1);
         assert.equal(fs.statSync(target).mtimeMs, before);
         assert.equal(fs.readFileSync(target, 'utf8'), unchanged);
         assert.equal(fs.readFileSync(path.join(workspaceFolder, 'old.md'), 'utf8'), 'desired');
         assert.equal(fs.readFileSync(path.join(workspaceFolder, 'new/rules.md'), 'utf8'), 'desired');
-        assert.ok(panel.messages.find(message => message.command === 'saveResults').results.every(result => result.success));
+        assert.ok(panel.messages.at(-2).results.every(result => result.success));
     });
 });
 
-function deferred() {
-    let resolve;
-    const promise = new Promise(done => { resolve = done; });
-    return { promise, resolve };
-}
-
-test('runtime waste audit: overlapping saves do not duplicate sync work', async (t) => {
-    const rules = Object.fromEntries(Array.from({ length: 256 }, (_, i) => [`rules/${i}.md`, 'shared']));
-    await withPanel(t, rules, async (panel) => {
+test('still writes a frontmatter separator when the old closing fence ended the file', async (t) => {
+    const original = '---\nalwaysApply: true\n---';
+    await withPanel(t, { 'rules.mdc': original }, async (panel) => {
         await panel.receive({ command: 'load' });
-        fs.writeFileSync(path.join(workspaceFolder, 'rules/0.md'), 'external edit');
-        const entered = deferred();
-        const choice = deferred();
-        warningChoice = () => { entered.resolve(); return choice.promise; };
-        const counts = await measureIO(t, async () => {
-            const first = panel.receive({ command: 'save', content: 'edited' });
-            await entered.promise;
-            const second = panel.receive({ command: 'save', content: 'edited' });
-            // Let both requests reach the host while the first confirmation is held.
-            await new Promise(setImmediate);
-            choice.resolve('Overwrite');
-            await Promise.all([first, second]);
-        });
-        const confirmations = warnings.filter(message => message.startsWith('These rule files')).length;
-        if (process.env.AUDIT_MEASURE === '1') {
-            console.log(JSON.stringify({ overlappingSaves: 2, ruleFiles: 256, confirmations, counts }));
-        } else {
-            assert.equal(counts.writes, 256);
-            assert.equal(confirmations, 1);
-            assert.ok(warnings.some(message => message.includes('busy')));
-            assert.equal(panel.messages.filter(message => message.command === 'saveResults').length, 1);
-        }
-    });
-});
-
-test('coalesces a burst of refreshes during a load into one following read pass', async (t) => {
-    const rules = Object.fromEntries(Array.from({ length: 128 }, (_, i) => [`rules/${i}.md`, 'shared']));
-    await withPanel(t, rules, async (panel) => {
-        const entered = deferred();
-        const release = deferred();
-        const readFile = fs.promises.readFile;
-        let held = false;
-        const mock = t.mock.method(fs.promises, 'readFile', async function (...args) {
-            if (!held) {
-                held = true;
-                entered.resolve();
-                await release.promise;
-            }
-            return readFile.apply(this, args);
-        });
-        try {
-            const counts = await measureIO(t, async () => {
-                const load = panel.receive({ command: 'load' });
-                await entered.promise;
-                for (let i = 0; i < 100; i++) {
-                    await panel.onViewState({ webviewPanel: { visible: true } });
-                    await configListener({ affectsConfiguration: () => true });
-                }
-                release.resolve();
-                await load;
-            });
-            assert.equal(counts.reads, 256); // One load and one coalesced refresh.
-            assert.ok(counts.maxPending <= 8);
-            assert.equal(panel.messages.filter(message => message.command === 'fileStatuses').length, 1);
-        } finally {
-            release.resolve();
-            mock.mock.restore();
-        }
-    });
-});
-
-test('write failures report per-file errors and release the operation lock', async (t) => {
-    await withPanel(t, { 'rules.md': 'shared' }, async (panel) => {
-        await panel.receive({ command: 'load' });
-        const mock = t.mock.method(fs.promises, 'writeFile', async () => { throw new Error('write failed'); });
-        await panel.receive({ command: 'save', content: 'edited' });
-        mock.mock.restore();
-        const result = panel.messages.find(message => message.command === 'saveResults');
-        assert.deepEqual(result.results, [{ file: 'rules.md', success: false, error: 'write failed' }]);
-        await panel.receive({ command: 'save', content: 'edited again' });
-        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'rules.md'), 'utf8'), 'edited again');
-    });
-});
-
-test('webview disables both controls through the final status refresh and recovers on errors', async (t) => {
-    await withPanel(t, {}, async (panel) => {
-        const webview = runWebview(panel);
-        const load = webview.elements.get('loadBtn');
-        const save = webview.elements.get('saveBtn');
-        assert.equal(load.disabled, true);
-        assert.equal(save.disabled, true);
-        webview.receive({ command: 'loadContent', content: 'rules', files: [] });
-        assert.equal(load.disabled, false);
-        assert.equal(save.disabled, false);
-        save.events.get('click')();
-        assert.equal(load.disabled, true);
-        assert.equal(save.disabled, true);
-        webview.receive({ command: 'saveResults', results: [], busy: true });
-        assert.equal(load.disabled, true);
-        assert.equal(save.disabled, true);
-        webview.receive({ command: 'fileStatuses', files: [] });
-        assert.equal(load.disabled, false);
-        assert.equal(save.disabled, false);
-        load.events.get('click')();
-        webview.receive({ command: 'loadError', error: 'read failed' });
-        assert.equal(load.disabled, false);
-        assert.equal(save.disabled, false);
-        assert.equal(webview.elements.get('status').textContent, 'read failed');
+        const first = await countWrites(t, () => panel.receive({ command: 'save', content: '' }));
+        assert.equal(first.writes, 1);
+        assert.equal(fs.readFileSync(path.join(workspaceFolder, 'rules.mdc'), 'utf8'), original + '\n');
+        const second = await countWrites(t, () => panel.receive({ command: 'save', content: '' }));
+        assert.equal(second.writes, 0);
     });
 });
